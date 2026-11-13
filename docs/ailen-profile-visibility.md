@@ -149,3 +149,13 @@
 - 下一步：Ailen 方便时，在 Truest Lens profile 的 Safari 设置里检查
   MCPSafari 的网站访问；或让我对一个 p0 tab 做 `select_tab` 再读
   （会切他的 Safari 前台标签，所以要等他方便时再测）。
+
+## 升级到 0.4.0（2026-11-14 03:00–03:20，Ailen 决定：不要新分支，直接升级扩展）
+
+- 回 port 分支 `ailen/protocol1-tabhandles` 是临时生产状态，已在验证通过后删除（本地 + 远端）。
+- Xcode 27.2（Build 27B52）：Ailen 用 `mas install 497799835` 自装；又跑了 `sudo xcodebuild -license` 和 `sudo xcodebuild -runFirstLaunch`（装 CoreSimulator 等首次启动组件）。Mac 上 0 个有效签名身份，扩展走免签（ad-hoc）+ Safari Develop → Allow Unsigned Extensions。
+- 扩展：fork main（`ailen/site-skills`，基于 main 13ba540）Release 编成功，`/Applications/MCPSafari.app` 换成 0.4.0（旧 0.3.2 备份在 fork `bin/MCPSafari-0.3.2.app`）；pluginkit 注册确认 `com.epistates.MCPSafari.Extension(0.4.0)`，`BRIDGE_PROTOCOL_VERSION = 2`。
+- 服务端：`bin/mcp-safari-main-0.4.0`（main Release 构建，`--version` 0.4.0）；frpc.toml 只改 `mcp-safari` plugin 的 command 一行（备份 `.bak-20261114-0303`），frpc 重启后新服务端在跑（协议 2，监听 8089）。
+- Safari 侧：扩展设置里同名出现 3 条是按 profile 各列一条（3 个 profile：DefaultProfile + 2 个 UUID，其中一个几乎是空的）；工具栏一个窗口只显示一个入口，正常。Ailen 在 Personal 和 Truest Lens 两个 profile 里启用并点了 Always Allow on Every Website。
+- 验证：bridge authenticated，服务端 + 扩展都是 0.4.0、协议 2，两个 profile 连上。`read_page` 在 p1（GitHub poki 仓库、抖音精选）成功。p0（Truest Lens）用 `javascript_tool` 在 Google 搜 boss 的 tab 上读到正文，注入没问题；`read_page`/`snapshot` 在这个 Google 搜索页上连报 `reply_lost`（page went away），是这个页面/操作组合的问题，不是权限问题——同页用 `javascript_tool` 取 `innerText` 正常。重启后未加载的 tab 读会报 `tab_not_loaded`，要 `select_tab` 切过去加载再读。另注意：p0 的 profile id 变了（62B2C9FA… → E45C0A0C-2661-4C2C-867E-883ED054CADA），认 profile 以 tab 内容为准，不要只认 p0/p1。
+- 结论：p0 读不到的旧问题根因就是网站访问授权没开（0.4.0 的 `tabs_context` 会直接报 `access: not_granted`，旧版只报注入失败）。升级完成，生产跑 main 0.4.0，不再维护回 port 分支。
