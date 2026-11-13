@@ -38,9 +38,10 @@ skills/
 
 ## Profile 的两条路
 
-- Ailen 个人 profile 的窗口：走 MCP（本仓库的服务端 + 扩展）。
-- Truest Lens 品牌 profile 的窗口：MCP 目前看不到（见
-  `docs/ailen-profile-visibility.md`），在修好之前走 AppleScript
-  `do JavaScript`（备忘在 Mac `~/Documents/Resources/tools/aisj-safari/AppleScript-Safari备忘.md`）。
-- 一个站的 skill 如果两个 profile 都要用到，要写清两条路分别怎么走，
+- 两个 profile 都走 MCP（0.4.0 起，服务端 + 扩展都能看到两个 profile，见
+  `docs/ailen-profile-visibility.md`）。用 tab 句柄 `pXtY` 区分 profile，
+  认 profile 以 tab 内容为准，不要只认 p0/p1（profile index 是每次服务端
+  启动时的连接顺序）。
+- AppleScript `do JavaScript` 只是备用路（备忘在 Mac
+  `~/Documents/Resources/tools/aisj-safari/AppleScript-Safari备忘.md`）。
   不要把两套窗口编号混用（MCP 的 windowId 和 AppleScript 的 window id 是两套编号）。
