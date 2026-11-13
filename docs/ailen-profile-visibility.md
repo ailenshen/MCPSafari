@@ -8,7 +8,7 @@
   `epistates/tap/mcp-safari-server`），不是 fork 的构建。
 - `status` 现在报 2 个 profile：`default`（index 0）和
   `62B2C9FA-35A1-4555-966A-672C5AA1E770`（index 1），bridge 已认证。
-- 但 `tabs_context` 返回的 tab 里没有 profile 归属字段（只有 id、url、
+- 但正在跑的 0.3.2 的 `tabs_context` 返回的 tab 里没有 profile 归属字段（只有 id、url、
   title、windowId），所以无法从 MCP 的输出判断哪个窗口属于哪个 profile。
   这就是 2026-11-07 的卡点一直没法用纯 MCP 数据定位的原因：
   真正的 Truest Lens profile 窗口（当时 AppleScript id 18357）在 MCP 里
@@ -32,19 +32,41 @@
   `"default"`，和已有连接撞了；另一种可能是该 profile 的扩展实例根本
   没发起连接。两者在现有 `status` 输出里看不出来。
 
-## 第一次修改：先加可观测性，不改行为
+## 更正（2026-11-14 02:0x，读源码后）：归属信息 fork main 里已经有了
 
-在 fork 上先做、且只做下面这三件，改完用 `swift build && swift test`
-  和 Node 测试验证，再决定要不要动扩展：
+上面“`tabs_context` 不带 profile 归属”的说法只对正在跑的 0.3.2 成立，
+对 fork 的 main 不成立，特此更正：
 
-1. `tabs_context` 的每个 tab 带上 `profileIndex`（服务端本来就有，
-   只是没往外报）。
-2. `status` 的每个 profile 带上 `tabCount` / `windowCount`。
-3. 服务端日志在握手完成时记一行：profileId、index、来源连接数。
+- 上游 `#95`（`db1c63f`，2026-09-14，0.3.2 打包之后才合入）已经做了
+  tab 句柄：`tabs_context` 向每个已连接 profile 广播 `tabs_query`，
+  再由 `mergedTabListing` 把每个 tab 的 id 改写成 `p<profileIndex>t<tabId>`
+  的形式（如 `p0t67`），重复的 tab 不再混在一起；`select_tab` /
+  `tabs_create` 也返回句柄，裸数字 tabId 会被拒绝并提示新形式。
+- `#95` 只改了服务端 Swift + 测试 + 文档，没有改扩展文件，所以
+  0.3.2 的扩展（协议版本同为 1）理论上能直接配合新服务端工作。
+- `ProfileStatus` 在 main 里也已经有 `handle`（`p<index>` 前缀）和
+  `selected` 字段，0.3.2 的 `status` 输出里还没有这两项。
 
-有了这三项，下次复查时直接能回答：`62B2C9FA…` 那个 profile 下面
-到底有几个窗口、是不是 Truest Lens 品牌窗口；如果它的 tab 数是 0，
-那就是扩展实例没连上或没上报 tab，再去查扩展侧。
+所以“第一次修改”不再是给 tab 加 profileIndex——那已经有了。
+真正的下一步是**跑起来验证**：用 fork main 编出的服务端（`swift build`
+已通过）去连一次扩展，看 `tabs_context` 回来的 tab 是不是
+`pXtY` 句柄、两个 profile 的窗口能不能分清，从而确定
+`62B2C9FA…` 是不是 Truest Lens profile。
+
+## 第一次验证（代替原来的“第一次修改”）
+
+1. 先隔离跑：fork 服务端起在另一个端口（如 8090），不碰正在跑的
+   8089；扩展会按 token 文件发现它并多连一个（多连接是它本来就
+   支持的状态），再用一个 stdio MCP 客户端在 Mac 本地对它调
+   `status` / `tabs_context`，核对句柄形式和每 profile 的窗口。
+2. 隔离验证通过后，再决定是否把生产服务（现在是 PID 46159，
+   2:03 启动的 `/opt/homebrew/bin/mcp-safari --port 8089`，没有
+   launchd 配置，是手动起的进程）换成 fork 的构建。换之前要 Ailen
+   点头，因为要停一下正在用的服务，扩展随后会重连。
+3. 只有隔离验证证明句柄还不够（比如 Truest Lens profile 的扩展实例
+   根本没连上、某个 profile 的 `tabs_query` 一直 unreachable），
+   才需要再写新代码；那时再按下面的“可观测性”思路补
+   （status 里每 profile 的 tab/window 数、握手日志）。
 
 ## 上游相关分支（看过，不直接用）
 
