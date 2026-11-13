@@ -87,3 +87,65 @@
   否则测试会误触正在用的真浏览器。
 - Grok 试点 skill（`skills/grok/`）先行：页面简单、已在 Safari 里问通过，
   跑通“建、测、坏、修”循环后再扩到小红书。
+
+## 换生产（2026-11-14 02:18）
+
+### 链路（实测）
+
+- VM client → `https://mcps.aisj.eu.org`（Aisj 托管网关，api key 在 URL path）
+  → frps `152.69.207.20:3103` → Mac frpc 的 `mcp-safari` 代理
+  （plugin `mcp_stdio`，command `/opt/homebrew/bin/mcp-safari --port 8089`，
+  `idleTimeoutSeconds = 0` 永不 idle 回收）→ frpc 拉起服务端进程
+  （所以 frpc 是 mcp-safari 的父进程）→ WebSocket bridge
+  `127.0.0.1:8089` → 各 profile 的扩展实例。
+- SSH 是另一条 FRP 路（STCP `mac-ssh`，VM visitor 127.0.0.1:2222 → Mac 22），
+  与 MCP 路径无关。VM 侧 visitor 配置里只有这一个 visitor。
+- Mac frpc 由 LaunchAgent `com.ailenshen.frp-frpc` 托管（KeepAlive、
+  RunAtLoad），重启前 PID 879，重启后 48895；其他代理（apple-notes-mcp
+  3101、filesystem-mcp 3102、mirroir-mcp STCP 3000）同在该 frpc 里，
+  重启时一起断、一起回。
+
+### 直接换 main 不可行，改走回 port
+
+- fork main 是 0.4.0，`bridgeProtocolVersion = 2`（`304543b` 互认证握手），
+  而装着的 0.3.2 扩展是协议 1，握手会被拒——只换服务端会把 MCP
+  直接换断。扩展要升到 2 需要 Xcode 重新构建，Mac 上现在没装。
+- 改走回 port：分支 `ailen/protocol1-tabhandles` = `v0.3.2` + `#95`
+  （`db1c63f`），协议仍是 1；CHANGELOG 只取 `#95` 的部分，去掉
+  `#94` 的条目（`#94` 的代码没要）。`swift build -c release` 通过
+  （51 秒），版本仍报 0.3.2。
+
+### 换法
+
+- 二进制拷到 `bin/mcp-safari-fork`（稳定路径，不依赖 `.build`）。
+- `frpc.toml` 备份 `frpc.toml.bak-20261114-0218`，只改 plugin command
+  一行（diff 确认一行）；`frpc verify` 先行通过；fork 二进制在
+  8090 上 smoke 通过（能起、能监听、版本 0.3.2）。
+- detached 脚本执行：先停旧服务，再 kill frpc（launchd 自动拉起），
+  SSH 会断一次，脚本在 Mac 本地跑完（日志 `/tmp/mcpsafari-swap.log`）。
+  冒烟留下的 8090 token 文件已删，tokens 目录现在只有 8089。
+
+### 验证结果
+
+- `status`：bridge authenticated，协议 1，2 个 profile 带
+  `handle` / `selected`：p0 = `62B2C9FA…`（selected false），
+  p1 = `default`（selected true）。
+- `tabs_context`：34 个 tab 全部是 `pXtY` 句柄——p0 是 Truest Lens
+  profile（1 个窗口 72192，13 个 tab：rednote、Creator Center、
+  真镜 TruestLens 的抖音、抖音创作者中心、Bilibili、视频号助手、
+  公众号等，全是品牌号页面）；p1 是 Ailen 个人 profile
+  （4 个窗口，21 个 tab）。唯一重复是置顶 X 标签 `p1t67` 在 4 个
+  窗口各出现一次，是置顶标签的正常行为，不是归属 bug。
+- 对照：p1 的 GitHub、小红书 explore 都能 `read_page` 读到正文。
+
+### 待查：p0 的 tab 读不到
+
+- `read_page` 在 p0 的 3 个 tab（Creator Center、Bilibili、rednote 搜索）
+  上都报 `Cannot inject content scripts into this tab`。对照组 p1
+  同站能读，所以不是 fork 服务端的问题，是 p0 的扩展实例注不进脚本。
+- 可能原因：（a）Truest Lens profile 里扩展的网站访问没开
+  “始终允许用于所有网站”；（b）这些 tab 自 Safari 重启后没被点开过、
+  处于未加载状态。
+- 下一步：Ailen 方便时，在 Truest Lens profile 的 Safari 设置里检查
+  MCPSafari 的网站访问；或让我对一个 p0 tab 做 `select_tab` 再读
+  （会切他的 Safari 前台标签，所以要等他方便时再测）。
