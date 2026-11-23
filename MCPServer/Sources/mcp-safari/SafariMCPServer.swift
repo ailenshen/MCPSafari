@@ -29,10 +29,11 @@ actor SafariMCPServer {
     init(
         port: UInt16 = 8089,
         portCount: UInt16 = WebSocketBridge.defaultPortCount,
-        logger: Logger
+        logger: Logger,
+        instance: InstanceIdentity = InstanceIdentity()
     ) throws {
         self.logger = logger
-        self.bridge = try WebSocketBridge(port: port, portCount: portCount, logger: logger)
+        self.bridge = try WebSocketBridge(port: port, portCount: portCount, logger: logger, instance: instance)
         self.server = Server(
             name: "mcp-safari",
             version: MCPSafariProduct.version,
@@ -59,7 +60,9 @@ actor SafariMCPServer {
             logger: logger
         )
         do {
-            try await server.start(transport: transport)
+            try await server.start(transport: transport) { [weak self] info, _ in
+                await self?.clientIntroduced(info)
+            }
             logger.info("Safari MCP server started")
             await server.waitUntilCompleted()
         } catch {
@@ -67,6 +70,20 @@ actor SafariMCPServer {
             throw error
         }
         await bridge.stop()
+    }
+
+    /// Tells Safari which MCP client is behind this server, for the tooltip on the
+    /// connection's row in the popup. Profiles that connect later get it in the
+    /// handshake. Not awaited by `initialize`: Safari may not be there yet, and a
+    /// label is no reason to hold up the client. An extension that predates
+    /// naming answers `identify` with "Unknown action", which is ignored with
+    /// every other failure here.
+    private func clientIntroduced(_ info: Client.Info) async {
+        let client = ClientIdentity(name: String(info.name.prefix(100)), version: String(info.version.prefix(100)))
+        await bridge.setClient(client)
+        Task { [bridge] in
+            _ = try? await bridge.broadcast(action: "identify", params: client.parameters, timeout: 5)
+        }
     }
 
     /// Takes the bridge down and removes its token files. For a signal, which ends the
@@ -259,7 +276,7 @@ actor SafariMCPServer {
     /// Rewrites the `id` of a tab object the extension returned into the handle
     /// that names it, so the only tab identifier a caller ever sees is one they
     /// can hand straight back.
-    private func tabResult(_ response: BridgeResponse, profileIndex: Int) -> CallTool.Result {
+    private func tabResult(_ response: BridgeResponse, profileIndex: Int, newWindowRequested: Bool = false) -> CallTool.Result {
         guard response.success, let raw = response.data?.stringValue else {
             return textResult(response, as: "tab")
         }
@@ -272,10 +289,22 @@ actor SafariMCPServer {
         tab["id"] = AnyCodable(TabHandle(profileIndex: profileIndex, tabID: tabID).description)
         var content = [Self.textContent(Self.jsonText(tab) ?? raw)]
         if let note = Self.accessNote(for: [tab]) { content.append(Self.textContent(note)) }
+        if let note = Self.newWindowNote(requested: newWindowRequested, tab: tab) { content.append(Self.textContent(note)) }
         return CallTool.Result(
             content: content,
             structuredContent: .object(["tab": (try? Value(tab)) ?? .null])
         )
+    }
+
+    /// An extension older than `newWindow` ignores it and opens the tab in the
+    /// window in front, and says nothing. One that opened a window says so in
+    /// the tab it reports, so its absence is how the caller hears about the
+    /// first case rather than believing it has a window of its own.
+    static func newWindowNote(requested: Bool, tab: [String: AnyCodable]) -> String? {
+        guard requested, tab["newWindow"]?.boolValue != true else { return nil }
+        return "The Safari extension is older than this server and opened the tab in the window in front, "
+            + "not in a new window. Update the MCPSafari app to get newWindow; until then, ask the user "
+            + "for a window of your own."
     }
 
     /// Tabs on a site Safari has not granted are listed, selected and created
@@ -322,13 +351,31 @@ actor SafariMCPServer {
 
     private func handleStatus() async throws -> CallTool.Result {
         let status = await bridge.status()
+        let instance = Self.instanceStatus(bridge.instance, client: await bridge.client)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(status)
+        var content = [Self.textContent(String(decoding: data, as: UTF8.self))]
+        content.append(Self.textContent(Self.jsonText(["instance": AnyCodable(instance)]) ?? "{}"))
         return CallTool.Result(
-            content: [Self.textContent(String(decoding: data, as: UTF8.self))],
-            structuredContent: .object(["status": try Value(status)])
+            content: content,
+            structuredContent: .object([
+                "status": try Value(status),
+                "instance": try Value(AnyCodable(instance)),
+            ])
         )
+    }
+
+    /// Who this server tells Safari it is: its name, the folder it was started in,
+    /// and the MCP client behind it.
+    static func instanceStatus(_ instance: InstanceIdentity, client: ClientIdentity?) -> [String: AnyCodable] {
+        var object: [String: AnyCodable] = [:]
+        object["name"] = AnyCodable(instance.name ?? NSNull())
+        object["folder"] = AnyCodable(instance.folder ?? NSNull())
+        if let client {
+            object["client"] = AnyCodable(["name": AnyCodable(client.name), "version": AnyCodable(client.version ?? NSNull())])
+        }
+        return object
     }
 
     /// Asks every connected profile for its tabs and returns one merged listing,
@@ -409,13 +456,14 @@ actor SafariMCPServer {
 
     private func handleTabsCreate(_ args: [String: Value]) async throws -> CallTool.Result {
         let profileIndex = try await resolveProfileIndex(args)
+        let params = try Self.tabsCreateParams(args)
         let response = try await bridge.send(
             action: "tabs_create",
-            params: try Self.tabsCreateParams(args),
+            params: params,
             timeout: Self.bridgeTimeout(args),
             profileIndex: profileIndex
         )
-        return tabResult(response, profileIndex: profileIndex)
+        return tabResult(response, profileIndex: profileIndex, newWindowRequested: params["newWindow"] != nil)
     }
 
     private func handleCloseTab(_ args: [String: Value]) async throws -> CallTool.Result {
@@ -463,31 +511,107 @@ actor SafariMCPServer {
         return findResult(response)
     }
 
-    /// Reads the caller's local files, then runs the interaction with them attached.
+    /// Sends the caller's local files to the page a chunk at a time, then runs the
+    /// interaction with them attached.
+    ///
+    /// The content script of the frame holding the target keeps the files until
+    /// the action: `stage_files` finds the target and opens a transfer there,
+    /// each `file_chunk` adds to it, and `upload_file` or `drop_file` builds the
+    /// files from what arrived. The chunks stay in the content script's isolated
+    /// world, so the page sees nothing until it is handed the finished files.
     private func handleFileAction(_ action: String, _ args: [String: Value]) async throws -> CallTool.Result {
         let inputs = try Self.fileAttachmentInputs(args)
-
-        let attachments: [FileAttachment]
+        let files: [OpenedFile]
         do {
-            attachments = try FileAttachmentLoader.load(paths: inputs.paths, mimeTypeOverride: inputs.mimeType)
+            files = try FileAttachmentLoader.open(paths: inputs.paths, mimeTypeOverride: inputs.mimeType)
         } catch let error as FileAttachmentError {
             throw ToolInputError(error.description)
         }
+        defer { FileAttachmentLoader.close(files) }
 
-        let files = attachments.map { attachment in
+        var stageParams = interactionParams(args, skipKeys: Self.fileInputKeys)
+        stageParams["intent"] = AnyCodable(action)
+        stageParams["files"] = AnyCodable(files.map { file in
             AnyCodable([
-                "name": AnyCodable(attachment.name),
-                "type": AnyCodable(attachment.mimeType),
-                "data": AnyCodable(attachment.base64),
+                "name": AnyCodable(file.name),
+                "type": AnyCodable(file.mimeType),
+                "size": AnyCodable(file.size),
             ] as [String: AnyCodable])
+        })
+        let staged = try await send("stage_files", args, params: stageParams)
+        guard staged.success else { return Self.failureResult(staged.toolFailure) }
+        guard let transfer = Self.stagedTransfer(staged) else {
+            return Self.failureResult(ToolFailure(
+                code: "extension_error",
+                message: "The Safari extension did not say where it is keeping the files.",
+                retryable: false,
+                recoveryAction: "inspect_error"
+            ))
         }
+        // Every chunk, and the action, go to the tab the target was found in.
+        let args = Self.pinned(args, to: staged)
 
-        return try await handleInteraction(
-            action,
-            args,
-            extraParams: ["files": AnyCodable(files)],
-            skipKeys: Self.fileInputKeys
-        )
+        do {
+            for (index, file) in files.enumerated() {
+                var offset = 0
+                while offset < file.size {
+                    let bytes: Data
+                    do {
+                        bytes = try FileAttachmentLoader.chunk(of: file, at: offset)
+                    } catch let error as FileAttachmentError {
+                        throw ToolInputError(error.description)
+                    }
+                    let sent = try await send("file_chunk", args, params: [
+                        "transfer": transfer,
+                        "file": AnyCodable(index),
+                        "offset": AnyCodable(offset),
+                        "data": AnyCodable(bytes.base64EncodedString()),
+                    ])
+                    guard sent.success else {
+                        await discardStagedFiles(transfer, args)
+                        return Self.failureResult(sent.toolFailure)
+                    }
+                    offset += bytes.count
+                }
+                // Before the page is handed anything, so a file that changed
+                // while it was read is let go rather than delivered.
+                do {
+                    try FileAttachmentLoader.confirmUnchanged(file)
+                } catch let error as FileAttachmentError {
+                    throw ToolInputError(error.description)
+                }
+            }
+            let result = try await handleInteraction(
+                action,
+                args,
+                extraParams: ["transfer": transfer],
+                skipKeys: Self.fileInputKeys
+            )
+            // The action takes the files whether it succeeds or not; this lets go
+            // of them if it never reached the content script.
+            if result.isError == true { await discardStagedFiles(transfer, args) }
+            return result
+        } catch {
+            await discardStagedFiles(transfer, args)
+            throw error
+        }
+    }
+
+    /// The transfer `stage_files` opened: its id and the frame that holds it.
+    static func stagedTransfer(_ response: BridgeResponse) -> AnyCodable? {
+        guard let raw = response.data?.stringValue,
+              let data = raw.data(using: .utf8),
+              let reply = try? JSONDecoder().decode([String: AnyCodable].self, from: data),
+              let id = reply["transferId"]?.stringValue,
+              let frameId = reply["frameId"]?.intValue
+        else { return nil }
+        return AnyCodable(["id": AnyCodable(id), "frameId": AnyCodable(frameId)] as [String: AnyCodable])
+    }
+
+    /// Best effort: the content script also lets go of a transfer nothing has
+    /// added to for a minute, and a page that navigated has dropped it already.
+    private func discardStagedFiles(_ transfer: AnyCodable, _ args: [String: Value]) async {
+        _ = try? await send("discard_files", args, params: ["transfer": transfer])
     }
 
     /// Unified handler for interaction tools: click, type_text, hover, scroll, press_key, select_option, drag.

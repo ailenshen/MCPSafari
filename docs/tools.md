@@ -17,7 +17,7 @@ This reference describes `main`, which may include tools and options not yet in 
 | Tool | Description |
 |-|-|
 | `tabs_context` | List open tabs across every connected Safari profile, with handles, state, and for sites MCPSafari has reached, URLs and titles (see [Website access](#website-access)) |
-| `tabs_create` | Open a new tab, optionally with a URL, in the Safari profile of `tabId` when given. With a URL it answers once the page has loaded, as `navigate` does |
+| `tabs_create` | Open a new tab, optionally with a URL, in the Safari profile of `tabId` when given. With a URL it answers once the page has loaded, as `navigate` does. With `newWindow: true` the tab opens in a new window of its own, offset from the window in front |
 | `close_tab` | Close a tab by handle |
 | `select_tab` | Pin a tab, and its Safari profile, as the default context for future calls |
 
@@ -82,7 +82,7 @@ A screenshot saved with `filePath` is written to a temporary file beside the des
 |-|-|
 | `javascript_tool` | Execute arbitrary JS in the page context and return expression results; multi-statement code must end in an explicit `return` to produce a value |
 
-If a site's Content Security Policy blocks string evaluation, the tool retries in the extension's isolated world and reports that in the result. It can still access the DOM there, but cannot read the page's JavaScript globals, such as framework instances on `window`. The CSP rejection happens before the submitted code runs.
+If a site's Content Security Policy blocks string evaluation, the tool runs the code in the extension's isolated world instead and reports that in the result. It can still access the DOM there, but cannot read the page's JavaScript globals, such as framework instances on `window`. Which world the code runs in is settled before any of it runs, by compiling it without running it, and the code then runs exactly once; nothing it returns or throws can move it to the other world.
 
 ### Debugging
 
@@ -145,6 +145,16 @@ Naming a profile that is not connected fails with `profile_not_connected` rather
 
 `tabs_context`, `tabs_create` and `select_tab` mark each tab `access: "granted"` or `"not_granted"`, with an `accessHint` pointing at the toolbar popup when it is not granted. `select_tab` on such a tab still succeeds and pins the tab's profile. The result also says in prose, once for a whole listing, that reading or acting on those tabs will fail with `permission_required` until the user grants the site.
 
+### Several agents at once
+
+Several MCP clients can drive Safari at the same time, each through its own server. Their calls don't wait for each other, except native input: there is one keyboard and one pointer, so native input runs one call at a time across every server. What the agents do share is Safari's windows: which window is in front, and which tab is showing in each one. To keep them out of each other's way:
+
+- Have each agent pass `tabId`, or pin its tab with `select_tab`. A call that names no tab, from an agent with no pin, acts on the tab in front, which another agent may have just changed.
+- Keep each agent's tabs in a window of its own: `tabs_create` with `newWindow: true` opens one, the same size as the window in front and 40 points down and to the right of it, so a strip of each stays visible. A window shows one tab at a time, so in a shared window one agent's `screenshot` or `select_tab` hides the other's tab, and two screenshots at once make one fail with the retryable `tab_not_showing`. Native input typed into a shared window can also end up in the other agent's tab, if that agent switches tabs while the typing is under way.
+- Keep each agent's window at least partly visible: not minimized, not completely covered by other windows, and on the current Space. Safari stops running animation frames for a page whose window is minimized or completely covered, so some web apps show stale or empty content until the window is visible again. A strip of the window on screen is enough. A screenshot of a hidden page says so in its result.
+
+The MCPSafari toolbar popup names each connection, so you can tell the agents apart. Once a server has connected it tells the extension who it is: the `--name` it was started with (or `MCP_SAFARI_NAME`), the folder it was started in, and the MCP client that introduced itself to it. Each connected row shows the name, or the last part of the folder when there is no name, with the folder on a second line and your home folder shortened to `~`. The row's tooltip has the connection's state and the client, such as `claude-code 2.1.0`. Two sessions started in the same folder show the same name, so give one of them a `--name`. A server that says neither, such as one started from `/` with no name, is shown by its port and state, as before. The name is what the server says about itself: a label for you, not proof of who is behind it. `status` reports the same under `instance`.
+
 ### Element targeting
 
 Targeting options vary by tool. `click` accepts all four:
@@ -190,12 +200,12 @@ Three limits are worth knowing. Native input (`native: true`) reaches the top fr
 
 ### Website access
 
-Safari grants extensions access one site at a time, and it asks the first time MCPSafari touches a site it has no answer for. That question is a modal dialog, and **it can open behind another window**. While it is unanswered, every extension call for that tab is blocked.
+Safari grants extensions access one site at a time. Safari 27.2 doesn't ask when MCPSafari first touches a site nobody has decided on: it refuses, and the only place to allow the site is the MCPSafari button in Safari's toolbar. Safari also hides that tab's address from the extension, so the refusal may not be able to name the site. Earlier versions of Safari have asked instead, with a modal dialog that **can open behind another window** and blocks every extension call for that tab until it's answered.
 
-So a tool that needs a page it has not been granted fails with `permission_required` rather than waiting. There are two versions of it, and the difference matters:
+So a tool that needs a page it hasn't been granted fails with `permission_required` rather than waiting. There are two versions of it, and the difference matters:
 
-- The dialog is open and waiting. The message says so and names the origin. Tell the user to look for the dialog, including behind other windows, and choose **Always Allow on This Website** or **Allow for One Day**.
-- Access was refused, or was never asked for on this origin. Tell the user to grant it from the MCPSafari button in Safari's toolbar, or in Safari Settings > Extensions > MCPSafari Extension.
+- The site isn't allowed. Tell the user to click the MCPSafari button while that tab is showing and allow the site, or to allow it in Safari Settings > Extensions > MCPSafari Extension. While a call is waiting for access, the button shows a **!** badge, and its tooltip names the site when Safari lets MCPSafari see it. The **!** goes once a call on that site gets through, the tab navigates or closes, or after 15 minutes. Safari shows one badge for the whole button, not one per tab.
+- A dialog is open and waiting (earlier Safari versions). The message says so and names the origin. Tell the user to look for the dialog, including behind other windows, and choose **Always Allow on This Website** or **Allow for One Day**.
 
 Both are `retryable`, because the same call works once access is granted. Granting every site at once is one click: **Always Allow on Every Website** in that same settings pane. That is also the only way to reach cross-origin iframes, since Safari's per-site grant covers the top-level page only.
 
@@ -211,7 +221,7 @@ Granted status is remembered across Safari restarts once a tool call has succeed
 
 Every tool that reads or acts on a page is gated this way, including `navigate` with `back` or `forward` (which runs a script in the page) and `resize_window`. A few operations are browser chrome and need no access to any page, so they work on an ungranted tab: `tabs_context`, `tabs_create`, `close_tab`, `select_tab`, and `navigate` with `goto` or `reload`. That is deliberate. Going to a new URL is how a caller gets off a page it cannot use, and selecting a tab only records which tab later calls mean.
 
-`select_tab` on a tab whose site is not granted succeeds. It pins the tab and brings it forward, and its result reports `"access": "not_granted"` with the same `accessHint` instead of a URL and title. The first call that reads the page then fails with `permission_required`, naming the site to grant.
+`select_tab` on a tab whose site is not granted succeeds. It pins the tab and brings it forward, and its result reports `"access": "not_granted"` with the same `accessHint` instead of a URL and title. The first call that reads the page then fails with `permission_required`, naming the site to grant when Safari lets MCPSafari see it.
 
 ### Results
 
@@ -219,7 +229,7 @@ Every successful tool result includes an object in `structuredContent`, alongsid
 
 | Tools | Structured fields |
 |-|-|
-| `status` | `status` with listener, authentication and profile details |
+| `status` | `status` with listener, authentication and profile details; `instance`, what this server tells Safari it is: its `name` and `folder` (each `null` when it has none) and, once the MCP client has introduced itself, `client` (`name` and `version`) |
 | `tabs_context` | `tabs` and `profileFailures`; an incomplete listing names the missing profiles |
 | `tabs_create`, `select_tab`, `close_tab` | `tab`, with the profile-qualified handle; close returns `id` and `closed` |
 | `read_page`, `snapshot`, `find` | `page`, `snapshot`, `matches` respectively; `find` adds `unreachableFrames` when it could not search every frame |
@@ -298,7 +308,7 @@ A `<select>` takes the option it names, by value or else by label, the same way 
 { "selector": "#dropzone", "filePaths": ["/tmp/a.pdf", "/tmp/b.pdf"] }
 ```
 
-The server reads only the paths you name, infers each MIME type from the file extension (override with `mimeType`), and sends the bytes to the page. `upload_file` accepts the input itself, its `<label>`, or a wrapper containing it, then fires `input` and `change`; `drop_file` dispatches `dragenter`, `dragover`, and `drop` with a `DataTransfer` holding the files, and finds a drop zone inside an open shadow root like any other. Up to 10 files and 10 MB total per call. Files inside MCPSafari's own token directories are refused, however the path is spelled or linked, including through a hard link, because the token is what authenticates the bridge; `navigate` and `tabs_create` refuse `file:` URLs into them for the same reason, and any `file:` URL with a backslash in its path, since Safari reads that as a slash.
+The server reads only the paths you name, infers each MIME type from the file extension (override with `mimeType`), and sends the bytes to the page. `upload_file` accepts the input itself, its `<label>`, or a wrapper containing it, then fires `input` and `change`; `drop_file` dispatches `dragenter`, `dragover`, and `drop` with a `DataTransfer` holding the files, and finds a drop zone inside an open shadow root like any other. Up to 10 files and 512 MB total per call, which covers an App Store app preview. The target is checked before any of a file is sent, so a call aimed at the wrong element fails at once. The files then go to the page's frame in 4 MB pieces, where the extension holds them out of the page's reach, and the page is handed them only when all of them have arrived. A file that changes while it is being sent is refused rather than sent as a mix of two versions. If the page reloads or navigates while the files are on their way, the call fails with the retryable `file_transfer_lost`. Files inside MCPSafari's own token directories are refused, however the path is spelled or linked, including through a hard link, because the token is what authenticates the bridge; `navigate` and `tabs_create` refuse `file:` URLs into them for the same reason, and any `file:` URL with a backslash in its path, since Safari reads that as a slash.
 
 ### Smart text matching
 

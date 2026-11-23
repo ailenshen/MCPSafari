@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
 import { once } from "node:events";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -154,8 +154,40 @@ test("every advertised tool returns object structuredContent over MCP", { timeou
     let queryTabs = [tab];
     const snapshot = { uid: "f0e1", tag: "body", children: [] };
     const trace = { events: [{ type: "click", timestamp: 1 }] };
+    // The content script's half of sending a file: staged against the target,
+    // added to a chunk at a time, and handed over by the action. Kept so a test
+    // can compare what arrived with what was sent.
+    const transfers = new Map();
+    let nextTransfer = 1;
+    let largestChunk = 0;
+    const delivered = [];
+    const discarded = [];
+    const stage = (params) => {
+        const transferId = `transfer-${nextTransfer++}`;
+        transfers.set(transferId, params.files.map((file) => ({ ...file, parts: [], received: 0 })));
+        return { transferId, frameId: 0 };
+    };
+    const addChunk = ({ transfer, file, offset, data }) => {
+        const entry = transfers.get(transfer.id)[file];
+        assert.equal(offset, entry.received, "a chunk arrived out of order");
+        const bytes = Buffer.from(data, "base64");
+        largestChunk = Math.max(largestChunk, bytes.length);
+        entry.parts.push(bytes);
+        entry.received += bytes.length;
+        return { received: entry.received };
+    };
+    const handOver = (action, transfer) => {
+        const files = transfers.get(transfer.id);
+        transfers.delete(transfer.id);
+        delivered.push(files.map(({ name, type, size, parts }) => ({ name, type, size, bytes: Buffer.concat(parts) })));
+        return `Completed ${action}`;
+    };
     const responseData = (action, params) => {
         switch (action) {
+            case "stage_files": return stage(params);
+            case "file_chunk": return addChunk(params);
+            case "discard_files": discarded.push(params.transfer.id); return { discarded: true };
+            case "upload_file": case "drop_file": return handOver(action, params.transfer);
             case "tabs_query": return queryTabs;
             case "tabs_create": return { id: tab.id, access: "granted", url: tab.url, title: tab.title };
             case "select_tab": return { id: tab.id, selected: true, access: "granted", url: tab.url, title: tab.title };
@@ -517,6 +549,38 @@ test("every advertised tool returns object structuredContent over MCP", { timeou
         ],
     }, /steps\[1\] \(navigate\): Invalid navigation action/);
 
+    // A file well over the old 10 MB limit, the size of an App Store preview,
+    // goes through a chunk per bridge message and arrives intact.
+    const preview = join(directory, "preview.mp4");
+    const previewBytes = randomBytes(30 * 1024 * 1024 + 123);
+    await writeFile(preview, previewBytes);
+    start = requests.length;
+    const uploaded = await tool("upload_file", { selector: "input", filePath: preview });
+    assert.equal(uploaded.structuredContent.result, "Completed upload_file");
+    const [arrived] = delivered.at(-1);
+    assert.deepEqual([arrived.name, arrived.type, arrived.size], ["preview.mp4", "video/mp4", previewBytes.length]);
+    assert.ok(arrived.bytes.equals(previewBytes), "the file arrived changed");
+    assert.equal(largestChunk, 4 * 1024 * 1024);
+    assert.deepEqual(sentSince(start), ["stage_files:-", ...Array(8).fill("file_chunk:7"), "upload_file:7"]);
+    // Several files in one drop each arrive whole, in order.
+    const second = join(directory, "second.txt");
+    await writeFile(second, "second file");
+    await tool("drop_file", { selector: "body", filePaths: [input, second] });
+    assert.deepEqual(delivered.at(-1).map(({ bytes }) => bytes.toString()), ["attached file", "second file"]);
+    // Over the limit is refused by its size before the page is asked for anything.
+    const huge = join(directory, "huge.mov");
+    await writeFile(huge, "");
+    await truncate(huge, 512 * 1024 * 1024 + 1);
+    await refuse("drop_file", { selector: "body", filePath: huge }, /512 MB total limit/);
+    // A chunk the extension refuses ends the call, and the staged part is let go.
+    const deliveredBefore = delivered.length;
+    failAction = "file_chunk";
+    const interrupted = await tool("upload_file", { selector: "input", filePath: preview }, false);
+    failAction = undefined;
+    assert.equal(interrupted.structuredContent.code, "permission_required");
+    assert.equal(discarded.at(-1), [...transfers.keys()].at(-1));
+    assert.equal(delivered.length, deliveredBefore, "an interrupted upload reached the page");
+
     // A step after a successful action can fail on its own. The failure keeps what
     // the action returned, so the caller who is told the wait timed out can still
     // read what the click did.
@@ -571,7 +635,10 @@ test("every advertised tool returns object structuredContent over MCP", { timeou
 
 /// Starts the real server on any free port and waits until its bridge is listening.
 /// The port it bound is how the token file is found.
-async function startServer(t, name) {
+///
+/// `initialize: false` leaves the MCP client unintroduced, for a test that has
+/// it introduce itself later. The server answers tool calls before that.
+async function startServer(t, name, { initialize = true } = {}) {
     // Its own token root, so no running Safari extension can find this server.
     const tokenRoot = await mkdtemp(join(tmpdir(), "mcpsafari-server-"));
     const server = spawn(binary, ["--port", "0"], { stdio: ["pipe", "pipe", "pipe"], env: serverEnvironment(tokenRoot) });
@@ -597,10 +664,12 @@ async function startServer(t, name) {
         assert.ok(answers.has(id), `no answer to ${method}: ${stderr}`);
         return answers.get(id).result;
     };
-    await ask("initialize", {
-        protocolVersion: "2025-11-25", capabilities: {},
-        clientInfo: { name, version: "1.0" },
-    });
+    if (initialize) {
+        await ask("initialize", {
+            protocolVersion: "2025-11-25", capabilities: {},
+            clientInfo: { name, version: "1.0" },
+        });
+    }
     // Status is how the port is learned, and asking also proves it came up.
     let status;
     for (let attempt = 0; attempt < 50; attempt++) {
@@ -637,13 +706,10 @@ for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
     });
 }
 
-// The two halves of the handshake are written in different languages, so each side's
-// own tests can only show it agrees with its own reading of the protocol. This runs
-// the extension's real background code, with its WebCrypto, against the real server.
-test("the extension's own handshake code authenticates against the server", { timeout: 30000 }, async (t) => {
-    const { ask, port, tokenFile } = await startServer(t, "interop-test");
-    const token = await readFile(tokenFile, "utf8");
-
+/// The extension's real background code, with its WebCrypto, connected to the
+/// server on `port`. Requests are answered without a browser behind them, apart
+/// from `identify`, which is about the connection itself and needs none.
+async function startExtension(t, port, token) {
     const listeners = [];
     const noop = () => {};
     const context = createContext({
@@ -670,9 +736,11 @@ test("the extension's own handshake code authenticates against the server", { ti
         },
     });
     runInContext(backgroundScriptSource(), context);
-    // Answer requests without a browser behind them.
     runInContext(
-        `handleRequest = async (request) => ({ id: request.id, success: true, data: JSON.stringify([{ id: 7, url: "https://example.com/", title: "T" }]) })`,
+        `const realHandleRequest = handleRequest;
+        handleRequest = async (request, port) => request.action === "identify"
+            ? realHandleRequest(request, port)
+            : ({ id: request.id, success: true, data: JSON.stringify([{ id: 7, url: "https://example.com/", title: "T" }]) })`,
         context
     );
     // Forget the connections as well as closing them, or the close schedules a
@@ -686,12 +754,65 @@ test("the extension's own handshake code authenticates against the server", { ti
         await new Promise((resolve) => setTimeout(resolve, 50));
     }
     assert.equal(runInContext(`connections.get(${port})?.state`, context), "connected");
+    return context;
+}
 
-    const status = (await ask("tools/call", { name: "status", arguments: {} })).structuredContent.status;
+/// Who the extension thinks is behind `port`, copied out of its realm.
+function connectionIdentity(context, port) {
+    return JSON.parse(runInContext(
+        `JSON.stringify({ instance: connections.get(${port}).instance, client: connections.get(${port}).client })`,
+        context
+    ));
+}
+
+// The two halves of the handshake are written in different languages, so each side's
+// own tests can only show it agrees with its own reading of the protocol. This runs
+// the extension's real background code, with its WebCrypto, against the real server.
+test("the extension's own handshake code authenticates against the server", { timeout: 30000 }, async (t) => {
+    const { ask, port, tokenFile } = await startServer(t, "interop-test");
+    const token = await readFile(tokenFile, "utf8");
+    const context = await startExtension(t, port, token);
+
+    // After the proofs, the server says who it is: the folder it was started in,
+    // and the MCP client that introduced itself before the extension connected.
+    assert.deepEqual(connectionIdentity(context, port), {
+        instance: { name: null, folder: process.cwd() },
+        client: { name: "interop-test", version: "1.0" },
+    });
+
+    const reported = (await ask("tools/call", { name: "status", arguments: {} })).structuredContent;
+    const status = reported.status;
+    assert.deepEqual(reported.instance, {
+        name: null, folder: process.cwd(), client: { name: "interop-test", version: "1.0" },
+    });
     assert.deepEqual(status.profiles.map(({ id }) => id), ["default"]);
     assert.equal(status.extensionVersion, "9.9.9");
     assert.equal(status.extensionProtocolVersion, BRIDGE_PROTOCOL_VERSION);
 
     const tabs = (await ask("tools/call", { name: "tabs_context", arguments: {} })).structuredContent;
     assert.equal(tabs.tabs[0].id, "p0t7", "a request made it to the extension and back");
+});
+
+// A client that introduces itself once Safari is already connected is named to
+// it with `identify`, served by the extension's real router. The fixture in the
+// first test connects after `initialize`, so it never sees this action.
+test("a client that introduces itself after Safari connected is named to it", { timeout: 30000 }, async (t) => {
+    const { ask, port, tokenFile } = await startServer(t, "unused", { initialize: false });
+    const token = await readFile(tokenFile, "utf8");
+    const context = await startExtension(t, port, token);
+    assert.equal(connectionIdentity(context, port).client, null);
+
+    await ask("initialize", {
+        protocolVersion: "2025-11-25", capabilities: {},
+        clientInfo: { name: "late-client", version: "3.0" },
+    });
+    let client = null;
+    for (let attempt = 0; attempt < 100 && !client; attempt++) {
+        client = connectionIdentity(context, port).client;
+        if (!client) await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.deepEqual(client, { name: "late-client", version: "3.0" });
+
+    const reported = (await ask("tools/call", { name: "status", arguments: {} })).structuredContent;
+    assert.deepEqual(reported.instance.client, { name: "late-client", version: "3.0" });
 });

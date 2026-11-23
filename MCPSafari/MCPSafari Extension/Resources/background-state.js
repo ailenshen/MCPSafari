@@ -10,7 +10,15 @@
 // given up on after AUTO_GIVE_UP_ATTEMPTS or AUTO_CLEANUP_MS.
 // Manually added ports are persisted in storage.local across restarts.
 
-/** @type {Map<number, {ws: WebSocket|null, state: string, attempts: number, manual: boolean, lastConnected: number}>} */
+/**
+ * `instance` and `client` are what the server and its MCP client say about
+ * themselves (see "Who a connection is" below). Both are reset each time a
+ * server authenticates, since a new run can be a different server.
+ *
+ * @type {Map<number, {ws: WebSocket|null, state: string, attempts: number, manual: boolean, lastConnected: number,
+ *   disconnectedAt?: number, instance?: {name: string|null, folder: string|null}|null,
+ *   client?: {name: string, version: string|null}|null}>}
+ */
 const connections = new Map();
 /** @type {Set<number>} Manually added ports (persisted across restarts) */
 const manualPorts = new Set();
@@ -63,8 +71,13 @@ function toolErrorFromResponse(response) {
 }
 
 // Two different situations, and the difference is the whole point: a dialog the
-// user has not seen yet, versus access they have already been refused. Both are
-// retryable, because in both cases a grant makes the same call work.
+// user has not seen yet, versus a site that isn't allowed. Both are retryable,
+// because in both cases a grant makes the same call work.
+//
+// Safari 27.2 shows no dialog for a site nobody has decided on: it refuses, and
+// the only place to allow the site is the toolbar button, which the refusal
+// marks with a "!" (see `markAwaitingAccess`). It also hides that tab's
+// address from the extension, which is why the site can go unnamed.
 function permissionRequiredError(origin, pending) {
     const site = origin ? `this tab (${origin})` : "this tab";
     const error = new Error(
@@ -72,11 +85,13 @@ function permissionRequiredError(origin, pending) {
             ? `MCPSafari needs the user to allow access to ${site}. Safari is showing a `
               + `permission dialog that blocks every call for this tab until it is answered, and `
               + `it can sit behind another window. Ask the user to find it and choose "Always `
-              + `Allow on This Website", then retry.`
-            : `MCPSafari is not allowed on ${site}. Ask the user to grant it from the MCPSafari `
-              + `button in Safari's toolbar, or in Safari Settings > Extensions > MCPSafari `
-              + `Extension, where "Always Allow on Every Website" also stops the per-site `
-              + `asking. Then retry.`
+              + `Allow on This Website", or, if there's no dialog, to allow the site from the `
+              + `MCPSafari button in Safari's toolbar. Then retry.`
+            : `MCPSafari isn't allowed on ${site}, and Safari doesn't ask by itself. Ask the user `
+              + `to click the MCPSafari button in Safari's toolbar while this tab is showing (it `
+              + `shows a "!" while access is waiting) and allow the site, or to allow it in `
+              + `Safari Settings > Extensions > MCPSafari Extension, where "Always Allow on Every `
+              + `Website" stops the asking for every site. Then retry.`
     );
     error.code = "permission_required";
     error.retryable = true;
@@ -240,6 +255,7 @@ async function probeAccess(tabId) {
             // about this site changes either way.
             refusal = permissionRequiredError(origin, true);
             tabAccessProbes.set(tabId, { at: Date.now(), error: refusal });
+            markAwaitingAccess(tabId, origin);
             throw refusal;
         }
         const message = String(err && err.message);
@@ -249,6 +265,7 @@ async function probeAccess(tabId) {
             throw err;
         }
         refusal = permissionRequiredError(origin, false);
+        markAwaitingAccess(tabId, origin);
     }
 
     // The tab can navigate while the probe is out, and the probe then ran on
@@ -262,6 +279,7 @@ async function probeAccess(tabId) {
     tabAccessProbes.set(tabId, { at: Date.now(), error: refusal });
     rememberOriginAccess(origin, refusal === null);
     if (refusal) throw refusal;
+    clearAwaitingAccess(tabId);
 }
 
 /**
@@ -304,6 +322,8 @@ function rememberOriginAccess(origin, granted) {
         return;
     }
     for (const refused of refusalsDuringLoads) refused.delete(origin);
+    // A grant is per site, so it answers every tab waiting on that site.
+    clearAwaitingOrigin(origin);
     // Re-adding moves it to the recent end. Only a change in what is stored is
     // written: a probe lands on most calls, and its order alone is not worth a
     // storage write.
@@ -374,3 +394,161 @@ function discoveredPortCount() {
     return count;
 }
 
+// ─── Who a connection is ─────────────────────────────────────────────
+//
+// Several MCP clients can share one Safari, each through a server of its own,
+// and a port number says nothing about which session is behind it. So once the
+// handshake is done a server says who it is: the `--name` it was started with,
+// the folder it was started in, and the MCP client that introduced itself to
+// it. The popup names each connection from that. It is what the server claims,
+// not proof, and nothing here decides anything by it; it is only shown.
+
+const MAX_INSTANCE_NAME_LENGTH = 64;
+const MAX_INSTANCE_FOLDER_LENGTH = 1024;
+const MAX_CLIENT_FIELD_LENGTH = 100;
+// Swift's `CharacterSet.controlCharacters`: control and format characters,
+// which covers zero-width joiners, soft hyphens and bidirectional marks as well.
+const CONTROL_OR_FORMAT = /[\p{Cc}\p{Cf}]/u;
+
+function shortString(value, max) {
+    return typeof value === "string" && value.length > 0 && value.length <= max ? value : null;
+}
+
+/**
+ * What a server says about itself after the handshake: its `--name` and the
+ * folder it was started in. Anything else, or any field of the wrong shape, is
+ * dropped, so a connection with nothing usable is named by its port.
+ */
+function readInstanceIdentity(value) {
+    if (!value || typeof value !== "object") return null;
+    return {
+        name: shortString(value.name, MAX_INSTANCE_NAME_LENGTH),
+        folder: shortString(value.folder, MAX_INSTANCE_FOLDER_LENGTH),
+    };
+}
+
+/** The MCP client behind a server, as that client describes itself. Shown, never trusted. */
+function readClientInfo(value) {
+    if (!value || typeof value !== "object") return null;
+    const name = shortString(value.name, MAX_CLIENT_FIELD_LENGTH);
+    if (!name) return null;
+    return { name, version: shortString(value.version, MAX_CLIENT_FIELD_LENGTH) };
+}
+
+function cleanInstanceName(name) {
+    if (typeof name !== "string") return null;
+    const trimmed = name.trim();
+    if (trimmed === "" || trimmed.length > MAX_INSTANCE_NAME_LENGTH) return null;
+    // Control and format characters would let a name rewrite the popup row it
+    // is shown in.
+    return CONTROL_OR_FORMAT.test(trimmed) ? null : trimmed;
+}
+
+function cleanInstanceFolder(folder) {
+    if (typeof folder !== "string" || !folder.startsWith("/") || folder.length > MAX_INSTANCE_FOLDER_LENGTH) return null;
+    if (CONTROL_OR_FORMAT.test(folder)) return null;
+    const trimmed = folder.replace(/\/+$/, "");
+    // A server started from `/` was started by something with no project, so the
+    // folder says nothing about who it is.
+    return trimmed === "" ? null : trimmed;
+}
+
+/** What the user sees a connection called: its name, its folder's last part, or its port. */
+function instanceLabel(instance, port) {
+    const name = cleanInstanceName(instance && instance.name);
+    if (name) return name;
+    const folder = cleanInstanceFolder(instance && instance.folder);
+    if (folder) return folder.slice(folder.lastIndexOf("/") + 1) || folder;
+    return `port ${port}`;
+}
+
+/**
+ * `identify`: the MCP client behind this server, sent once the client has
+ * introduced itself. A profile that connects after that is told in the
+ * handshake instead.
+ */
+async function handleIdentify(params, serverPort) {
+    const conn = connections.get(serverPort);
+    if (conn) conn.client = readClientInfo(params && params.client);
+    return { client: conn ? conn.client : null };
+}
+
+
+// ─── Access the user hasn't given yet ───────────────────────────────
+//
+// Safari 27.2 refuses a site the user hasn't decided on without asking: no
+// dialog appears, and the only place to allow it is the MCPSafari button in the
+// toolbar, which gave no sign anything was waiting. So a refusal marks its tab
+// as waiting, and while any tab is waiting the button shows a "!" and its
+// tooltip names the site. The mark is the button's own, shown on every tab:
+// WebKit wipes a tab's badge whenever the tab navigates, and none showed at all
+// in a test on Safari 27.2. Safari draws badges in its own colour and ignores
+// `setBadgeBackgroundColor`, so the "!" is the signal.
+
+/** tabId to the site a call on it was refused for, and when. @type {Map<number, {origin: string|null, at: number}>} */
+const tabsAwaitingAccess = new Map();
+// A request nobody has acted on in this long stops being news. Checked on the
+// keepalive alarm, about every 24 seconds, so it goes within a minute of that.
+const ACCESS_WAIT_SHOWN_MS = 15 * 60 * 1000;
+const ACCESS_BADGE_TEXT = "!";
+
+function markAwaitingAccess(tabId, origin) {
+    tabsAwaitingAccess.set(tabId, { origin, at: Date.now() });
+    showAccessBadge();
+}
+
+function clearAwaitingAccess(tabId) {
+    if (tabsAwaitingAccess.delete(tabId)) showAccessBadge();
+}
+
+function clearAwaitingOrigin(origin) {
+    let changed = false;
+    for (const [tabId, wait] of tabsAwaitingAccess) {
+        if (wait.origin === origin) {
+            tabsAwaitingAccess.delete(tabId);
+            changed = true;
+        }
+    }
+    if (changed) showAccessBadge();
+}
+
+function expireAccessWaits() {
+    const now = Date.now();
+    let changed = false;
+    for (const [tabId, wait] of tabsAwaitingAccess) {
+        if (now - wait.at >= ACCESS_WAIT_SHOWN_MS) {
+            tabsAwaitingAccess.delete(tabId);
+            changed = true;
+        }
+    }
+    if (changed) showAccessBadge();
+}
+
+function showAccessBadge() {
+    const waits = [...tabsAwaitingAccess.values()];
+    if (waits.length === 0) {
+        setAccessBadge("", "MCPSafari");
+        return;
+    }
+    // Safari doesn't show an extension the address of a tab on a site it hasn't
+    // been allowed, so the site can be unknown.
+    const hosts = [...new Set(waits.filter((wait) => wait.origin).map((wait) => new URL(wait.origin).host))];
+    setAccessBadge(
+        ACCESS_BADGE_TEXT,
+        hosts.length > 0
+            ? `MCPSafari is waiting for access to ${hosts.join(", ")}. On that tab, click here to allow it.`
+            : "MCPSafari is waiting for access to a site. On its tab, click here to allow it."
+    );
+}
+
+// Best effort, one call at a time: Safari may lack any of these, and the badge
+// only helps the user find the button.
+function setAccessBadge(text, title) {
+    const action = browser.action;
+    if (!action) return;
+    const quietly = (call) => {
+        try { Promise.resolve(call()).catch(() => {}); } catch (_) { /* not supported here */ }
+    };
+    quietly(() => action.setBadgeText({ text }));
+    quietly(() => action.setTitle({ title }));
+}

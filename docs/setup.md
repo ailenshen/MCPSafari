@@ -11,17 +11,17 @@ These instructions describe `main`. For an installed release, use the documentat
 Installs the MCP server binary and the Safari extension app to `/Applications`.
 
 ```bash
-brew trust epistates/tap
+brew trust --formula epistates/tap/mcp-safari-server
 brew install --cask epistates/tap/mcp-safari
 ```
 
-The `brew trust` line is needed once. Installing a cask auto-trusts the cask itself, but this cask depends on the `mcp-safari-server` formula, and a differently named dependency in the same tap is not covered by that. Without it the install stops at `Refusing to load formula epistates/tap/mcp-safari-server from untrusted tap`.
+The `brew trust` line is needed once. Homebrew 7 loads packages from a third-party tap only once you trust them, and installing a cask by its full name trusts the cask itself, but not the `mcp-safari-server` formula it depends on. Without it the install stops at `Refusing to load formula epistates/tap/mcp-safari-server from untrusted tap`. `brew trust epistates/tap` also works, but it trusts everything in the tap, now and later.
 
-Upgrading, both parts together:
+Upgrading, both parts together, by their full names and server first. Naming them also trusts them, which an install from before Homebrew 7 needs; a plain `brew upgrade` may keep the version you have.
 
 ```bash
-brew upgrade --cask epistates/tap/mcp-safari
 brew upgrade epistates/tap/mcp-safari-server
+brew upgrade --cask epistates/tap/mcp-safari
 ```
 
 Upgrading only the cask leaves the server behind, because a cask depends on a formula being present rather than being any particular version. That gives you a new app and extension against an old server, which the versioned handshake rejects. `mcp-safari doctor` reports it as a version mismatch and names the fix, so it fails loudly rather than misbehaving.
@@ -141,6 +141,8 @@ Any client that supports the MCP stdio transport can connect. Point it at `mcp-s
 
 Each MCP client starts its own server. A server takes `8089` if it is free and otherwise the next free port, and the extension connects to each one wherever it landed. These connections share Safari tabs and browser state.
 
+The MCPSafari toolbar popup names each connection, so you can tell the sessions apart: by the name you gave its server with `--name` (or `MCP_SAFARI_NAME`), or else by the last part of the folder the server was started in, with that folder on a line below. Two sessions started in the same folder show the same name, so give one of them a `--name`. See [Several agents at once](tools.md#several-agents-at-once).
+
 ### Ports
 
 A server tries `8089` and then the ports after it, ten in all by default: `8089` and the next nine, up to `8098`. `--port` moves where it starts and `--port-range` changes how many ports it tries, from 1 to 64:
@@ -176,6 +178,7 @@ Every connected profile is drivable. `tabs_context` lists the tabs of all of the
 | `--port-range <n>` | How many consecutive ports to try from `--port`, 1 to 64 (default: `10`). Also `MCP_SAFARI_PORT_RANGE`. See [Ports](#ports) |
 | `--log-level <level>` | `trace`, `debug`, `info`, `notice`, `warning`, `error`, or `critical` (default: `notice`) |
 | `--verbose` | Shorthand for `--log-level debug` |
+| `--name <name>` | What the MCPSafari toolbar popup calls this server, up to 64 characters with no control characters (default: the last part of the folder the server was started in). Also `MCP_SAFARI_NAME`. See [Multiple MCP clients](#multiple-mcp-clients) |
 | `--help` / `-h` | Print usage and exit |
 | `--version` / `-V` | Print the version and exit |
 
