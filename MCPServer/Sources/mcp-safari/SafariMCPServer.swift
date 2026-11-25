@@ -33,7 +33,16 @@ actor SafariMCPServer {
         instance: InstanceIdentity = InstanceIdentity()
     ) throws {
         self.logger = logger
-        self.bridge = try WebSocketBridge(port: port, portCount: portCount, logger: logger, instance: instance)
+        let graceSeconds = ProcessInfo.processInfo.environment["MCP_SAFARI_CONNECT_GRACE_SECONDS"]
+            .flatMap(Double.init)
+            .map { max(0, $0) } ?? 12
+        self.bridge = try WebSocketBridge(
+            port: port,
+            portCount: portCount,
+            logger: logger,
+            connectGraceTimeout: .seconds(graceSeconds),
+            instance: instance
+        )
         self.server = Server(
             name: "mcp-safari",
             version: MCPSafariProduct.version,
@@ -41,7 +50,8 @@ actor SafariMCPServer {
                 Safari browser automation. Use tabs_context to list tabs, snapshot for element UIDs, \
                 then click/type_text/hover by UID. Use includeSnapshot on interactions to see updated state. \
                 Tab handles look like p0t5, where p0 names the Safari profile; read them from \
-                tabs_context rather than composing them.
+                tabs_context rather than composing them. If a call reports bridge_disconnected right after \
+                startup or reconnect, call status to check or retry after a few seconds before assuming Safari is closed.
                 """,
             capabilities: Server.Capabilities(
                 logging: .init(),
@@ -82,7 +92,7 @@ actor SafariMCPServer {
         let client = ClientIdentity(name: String(info.name.prefix(100)), version: String(info.version.prefix(100)))
         await bridge.setClient(client)
         Task { [bridge] in
-            _ = try? await bridge.broadcast(action: "identify", params: client.parameters, timeout: 5)
+            _ = try? await bridge.broadcast(action: "identify", params: client.parameters, timeout: 5, waitForConnection: false)
         }
     }
 
@@ -334,6 +344,9 @@ actor SafariMCPServer {
     /// profile and named as if it were in another.
     private func resolveProfileIndex(_ args: [String: Value]) async throws -> Int {
         if let handle = try TabHandle.resolve(args["tabId"]) { return handle.profileIndex }
+        if await bridge.connectedProfiles().isEmpty {
+            try await bridge.waitForConnection()
+        }
         guard let selected = await bridge.connectedProfiles().first(where: \.selected) else {
             throw await bridge.noConnectionError()
         }
